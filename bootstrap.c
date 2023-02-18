@@ -557,19 +557,22 @@ static uint8_t return_regs[] = {RAX, RBX, RDX, RDI, RSI};
 static char *parse_expression(char *data, struct scope *scope, int *stack_values, int *does_return, int expected_values);
 static char *parse_block(char *data, struct scope *scope, int local_count, int *does_return);
 
-static char *parse_varargs(char *data, struct scope *scope, int *stack_values, int *does_return) {
+static char *parse_varargs(char *data, struct scope *scope, int *stack_values, int *does_return, int *vararg_count, int do_push) {
   int token, length, vararg_stack_values = 0;
   EXPECT(TOK_LSQUARE, "Expected opening square bracket before varargs");
   while (!MATCHES(TOK_RSQUARE)) {
     data = parse_expression(data, scope, &vararg_stack_values, does_return, -1);
   }
   EXPECT(TOK_RSQUARE, "Expected closing square bracket after varargs");
-  // push imm8
-  emit8(0x6A);
-  emit8(vararg_stack_values);
-  // pop r12
-  emit8(0x41);
-  emit8(0x5C);
+  *vararg_count = vararg_stack_values;
+  if (do_push) {
+    // push imm8
+    emit8(0x6A);
+    emit8(vararg_stack_values);
+    // pop r12
+    emit8(0x41);
+    emit8(0x5C);
+  }
   return data;
 }
 
@@ -581,7 +584,8 @@ static char *parse_ident_expr(char *data, struct scope *scope, struct identifier
     case IDENT_FUNC: {
       data = parse_expression(data, scope, stack_values, does_return, ident->func.arity);
       if (ident->func.flags & FUNC_VARARG) {
-        data = parse_varargs(data, scope, stack_values, does_return);
+        int vararg_count;
+        data = parse_varargs(data, scope, stack_values, does_return, &vararg_count, 1);
       }
       size_t call_addr = emitted_text_length;
       emit8(0xE8);
@@ -1103,18 +1107,16 @@ static char *handle_builtin_entry(char *data, struct scope *scope, int *stack_va
 }
 
 static char *handle_builtin_syscall(char *data, struct scope *scope, int *stack_values, int *does_return) {
-  int token, length;
-  union token arg_count = EXPECT(TOK_INT, "Expected syscall argument count");
-  ASSERT(arg_count.int_value > 0, "Expected at least one syscall argument");
-  ASSERT(arg_count.int_value <= sizeof(syscall_regs), "Expected at most 7 syscall arguments");
-  data = parse_expression(data, scope, stack_values, does_return, (int)arg_count.int_value);
-  for (int i = 0; i < (int)arg_count.int_value; i++) {
-    pop_reg(syscall_regs[(int)arg_count.int_value - i - 1]);
+  int token, lengthm, vararg_count;
+  data = parse_varargs(data, scope, stack_values, does_return, &vararg_count, 0);
+  ASSERT(vararg_count > 0, "Expected at least one syscall argument");
+  ASSERT(vararg_count <= (int)sizeof(syscall_regs), "Expected at most 7 syscall arguments");
+  for (int i = 0; i < vararg_count; i++) {
+    pop_reg(syscall_regs[vararg_count - i - 1]);
   }
   emit8(0x0F);
   emit8(0x05);
   push_reg(RAX);
-  *stack_values -= (int)arg_count.int_value;
   *stack_values += 1;
   return data;
 }
