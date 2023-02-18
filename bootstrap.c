@@ -79,6 +79,7 @@ enum {
   FUNC_NORET = 1 << 0,
   FUNC_HASLOCALS = 1 << 1,
   FUNC_VARARG = 1 << 2,
+  FUNC_CLOBBERS_R12 = 1 << 3,
 };
 
 struct identifier {
@@ -147,14 +148,21 @@ static size_t emit_data_bytes(uint8_t value, size_t count) {
   return result;
 }
 
-#define EMIT(x) static size_t emit##x(uint##x##_t value) { return emit_text(&value, sizeof(value)); }
+static size_t emit8(uint8_t value) {
+  return emit_text(&value, sizeof(value));
+}
 
-EMIT(8)
-EMIT(16)
-EMIT(32)
-EMIT(64)
+static size_t emit16(uint16_t value) {
+  return emit_text(&value, sizeof(value));
+}
 
-#undef EMIT
+static size_t emit32(uint32_t value) {
+  return emit_text(&value, sizeof(value));
+}
+
+static size_t emit64(uint64_t value) {
+  return emit_text(&value, sizeof(value));
+}
 
 static struct identifier *lookup_ident(struct scope *scope, char *name, size_t length, int create) {
   struct identifier *ident = NULL;
@@ -582,6 +590,9 @@ static char *parse_ident_expr(char *data, struct scope *scope, struct identifier
     case IDENT_NONE:
       ASSERT(0, "Use of undefined identifier '%s'\n", ident->ident);
     case IDENT_FUNC: {
+      if (current_func->func.flags & FUNC_VARARG) {
+        push_reg(12);
+      }
       data = parse_expression(data, scope, stack_values, does_return, ident->func.arity);
       if (ident->func.flags & FUNC_VARARG) {
         int vararg_count;
@@ -601,6 +612,9 @@ static char *parse_ident_expr(char *data, struct scope *scope, struct identifier
         }
         if (ident->func.arity > 0) {
           add_reg_imm(RSP, ident->func.arity * 8);
+        }
+        if (current_func->func.flags & FUNC_VARARG) {
+          pop_reg(12);
         }
         for (int i = 0; i < ident->func.returns; i++) {
           push_reg(return_regs[i]);
@@ -684,8 +698,8 @@ static char *parse_expression(char *data, struct scope *scope, int *stack_values
       }
       case TOK_STR: {
         union token str_tok = ADVANCE;
-        size_t ptr = emit_data(str_tok.str_value, strlen(str_tok.str_value) + 1);
-        movabs(RAX, ptr + DATA_ADDR);
+        size_t str_addr = emit_data(str_tok.str_value, strlen(str_tok.str_value) + 1);
+        movabs(RAX, str_addr + DATA_ADDR);
         push_reg(RAX);
         new_stack_values += 1;
         break;
@@ -701,7 +715,7 @@ static char *parse_expression(char *data, struct scope *scope, int *stack_values
               emit_text("\x42\x8F\x84\xE5", 4);
               emit32(target.ident->stack_slot * 8);
             } else {
-              // pop [rbp disp32]
+              // pop [rbp + disp32]
               emit8(0x8F);
               emit_modrm(0b10, 0, RBP);
               emit32(target.ident->stack_slot * 8);
@@ -741,38 +755,32 @@ static char *parse_expression(char *data, struct scope *scope, int *stack_values
         new_stack_values -= 1;
         break;
       case TOK_PLUS:
+      case TOK_STAR: {
+        ADVANCE;
+        data = parse_expression(data, scope, &new_stack_values, does_return, 2);
+        pop_reg(RAX);
+        switch (token) {
+          case TOK_PLUS:
+            emit_text("\x48\x03\x04\x24", 4); // add rax, [rsp]
+            break;
+          case TOK_STAR:
+            emit_text("\x48\xF7\x24\x24", 4); // mul qword ptr [rsp]
+            break;
+        }
+        emit_text("\x48\x89\x04\x24", 4); // mov qword ptr [rsp], rax
+        new_stack_values -= 1;
+        break;
+      }
       case TOK_MINUS: {
         ADVANCE;
         data = parse_expression(data, scope, &new_stack_values, does_return, 2);
         pop_reg(RBX); // rhs
         pop_reg(RAX); // lhs
-        switch (token) {
-          case TOK_PLUS:
-            // add r64, r/m64
-            emit8(0x48);
-            emit8(0x01);
-            emit8(0xD8);
-            break;
-          case TOK_MINUS:
-            // sub r64, r/m64
-            emit8(0x48);
-            emit8(0x29);
-            emit8(0xD8);
-            break;
-        }
+        emit_text("\x48\x29\xD8", 3); // sub rax, rbx
         push_reg(RAX);
         new_stack_values -= 1;
         break;
       }
-      case TOK_STAR: {
-        ADVANCE;
-        data = parse_expression(data, scope, &new_stack_values, does_return, 2);
-        pop_reg(RAX);
-        emit_text("\x48\xF7\x24\x24", 4); // mul qword ptr [rsp]
-        emit_text("\x48\x89\x04\x24", 4); // mov qword ptr [rsp], rax
-        new_stack_values -= 1;
-        break;
-      };
       case TOK_SLASH:
       case TOK_PERC:
         ADVANCE;
@@ -987,6 +995,7 @@ static struct scope *parse_file(char *path) {
           if (MATCHES(TOK_3DOTS)) {
             ADVANCE;
             fn_name.ident->func.flags |= FUNC_VARARG;
+            fn_name.ident->func.flags |= FUNC_CLOBBERS_R12;
           } else {
             union token arg_name = EXPECT(TOK_IDENT, "Expected an argument name");
             ASSERT(arg_name.ident->type == IDENT_NONE, "Function argument '%s' was already defined before\n", arg_name.ident->ident);
