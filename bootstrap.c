@@ -566,7 +566,16 @@ static uint8_t return_regs[] = {RAX, RBX, RDX, RDI, RSI};
 static char *parse_expression(char *data, struct scope *scope, int *stack_values, int *does_return, int expected_values);
 static char *parse_block(char *data, struct scope *scope, int local_count, int *does_return);
 
-static char *parse_varargs(char *data, struct scope *scope, int *stack_values, int *does_return, int *vararg_count, int do_push) {
+static void setup_r12(int value) {
+  if (value > 0) {
+    // push imm8
+    emit8(0x6A);
+    emit8(value);
+  }
+  pop_reg(12);
+}
+
+static char *parse_varargs(char *data, struct scope *scope, int *stack_values, int *does_return, int *vararg_count) {
   int token, length, vararg_stack_values = 0;
   EXPECT(TOK_LSQUARE, "Expected opening square bracket before varargs");
   while (!MATCHES(TOK_RSQUARE)) {
@@ -574,14 +583,6 @@ static char *parse_varargs(char *data, struct scope *scope, int *stack_values, i
   }
   EXPECT(TOK_RSQUARE, "Expected closing square bracket after varargs");
   *vararg_count = vararg_stack_values;
-  if (do_push) {
-    // push imm8
-    emit8(0x6A);
-    emit8(vararg_stack_values);
-    // pop r12
-    emit8(0x41);
-    emit8(0x5C);
-  }
   return data;
 }
 
@@ -591,13 +592,15 @@ static char *parse_ident_expr(char *data, struct scope *scope, struct identifier
     case IDENT_NONE:
       ASSERT(0, "Use of undefined identifier '%s'\n", ident->ident);
     case IDENT_FUNC: {
-      if (current_func->func.flags & FUNC_VARARG) {
+      int save_r12 = current_func->func.flags & FUNC_VARARG && ident->func.flags & FUNC_CLOBBERS_R12;
+      if (save_r12) {
         push_reg(12);
       }
       data = parse_expression(data, scope, stack_values, does_return, ident->func.arity);
       if (ident->func.flags & FUNC_VARARG) {
         int vararg_count;
-        data = parse_varargs(data, scope, stack_values, does_return, &vararg_count, 1);
+        data = parse_varargs(data, scope, stack_values, does_return, &vararg_count);
+        setup_r12(vararg_count);
       }
       size_t call_addr = emitted_text_length;
       emit8(0xE8);
@@ -614,7 +617,7 @@ static char *parse_ident_expr(char *data, struct scope *scope, struct identifier
         if (ident->func.arity > 0) {
           add_reg_imm(RSP, ident->func.arity * 8);
         }
-        if (current_func->func.flags & FUNC_VARARG) {
+        if (save_r12) {
           pop_reg(12);
         }
         for (int i = 0; i < ident->func.returns; i++) {
@@ -1077,29 +1080,44 @@ static char *handle_builtin_unreachable(char *data, struct scope *scope, int *st
 static char *handle_builtin_arg(char *data, struct scope *scope, int *stack_values, int *does_return) {
   *does_return = 1;
   int token, length;
-  emit_text("\x4C\x89\xE0", 3); // mov rax, r12
-  emit_text("\x48\xC1\xE0\x03", 4); // shl rax, 3
   if (MATCHES(TOK_INT)) {
-    union token arg_index = EXPECT(TOK_INT, "Expected argument index");
-    sub_reg_imm(RAX, (arg_index.int_value - 1) * 8);
+    union token arg_index = ADVANCE;
+    // push [rbp + r12 * 8 + disp32]
+    emit_text("\x42\xFF\xB4\xE5", 4);
+    emit32(-(arg_index.int_value - 1) * 8);
     *stack_values += 1;
 } else {
     data = parse_expression(data, scope, stack_values, does_return, 1);
     pop_reg(RBX);
-    emit_text("\x48\xFF\xCB", 3); // dec rbx
-    emit_text("\x48\xC1\xE3\x03", 4); // shl rbx, 3
-    emit_text("\x48\x29\xD8", 3); // sub rax, rbx
+    emit_text("\x48\xF7\xDB", 3); // neg rbx
+    emit_text("\x4A\x8D\x44\xE5\x08", 5); // lea rax, [rbp + r12 * 8 + 8]
+    emit_text("\xFF\x34\xD8", 3); // push [rax + rbx * 8]
   }
-  emit_text("\xFF\x74\x05\x00", 4); // push [rbp + rax]
   return data;
 }
 
 static char *handle_builtin_argc(char *data, struct scope *scope, int *stack_values, int *does_return) {
   *does_return = 1;
   *stack_values += 1;
-  // push r12
-  emit8(REX_B);
-  emit8(0x50 | (12 & 7));
+  push_reg(12);
+  return data;
+}
+
+static char *handle_builtin_fwargs(char *data, struct scope *scope, int *stack_values, int *does_return) {
+  *does_return = 1;
+  emit_text("\x6A\x00", 2); // push 0
+  pop_reg(RAX);
+loop:
+  emit_text("\x4C\x39\xE0", 3); // cmp rax, r12
+  emit_text("\x74\x13", 2); // jz out
+  mov_reg_reg(RBX, RAX);
+  emit_text("\x48\xF7\xDB", 3); // neg rbx
+  emit_text("\x4A\x8D\x4C\xE5\x08", 5); // lea rcx, [rbp + r12 * 8 + 8]
+  emit_text("\xFF\x34\xD9", 3); // push [rcx + rbx * 8]
+  emit_text("\x48\xFF\xC0", 3); // inc rax
+  emit_text("\xEB\xE8", 2); // jmp loop
+out:
+  push_reg(12);
   return data;
 }
 
@@ -1129,9 +1147,10 @@ static char *handle_builtin_call(char *data, struct scope *scope, int *stack_val
   *stack_values += 1;
   int token, length, vararg_count, actual_vararg_count = 0, has_varargs = 0;
   data = parse_expression(data, scope, stack_values, does_return, 1);
-  data = parse_varargs(data, scope, stack_values, does_return, &vararg_count, 0);
+  data = parse_varargs(data, scope, stack_values, does_return, &vararg_count);
   if (MATCHES(TOK_LSQUARE)) {
-    data = parse_varargs(data, scope, stack_values, does_return, &actual_vararg_count, 1);
+    data = parse_varargs(data, scope, stack_values, does_return, &actual_vararg_count);
+    setup_r12(actual_vararg_count);
     has_varargs = 1;
   }
   // call [rsp + disp32]
@@ -1167,7 +1186,7 @@ static char *handle_builtin_entry(char *data, struct scope *scope, int *stack_va
 
 static char *handle_builtin_syscall(char *data, struct scope *scope, int *stack_values, int *does_return) {
   int token, lengthm, vararg_count;
-  data = parse_varargs(data, scope, stack_values, does_return, &vararg_count, 0);
+  data = parse_varargs(data, scope, stack_values, does_return, &vararg_count);
   ASSERT(vararg_count > 0, "Expected at least one syscall argument");
   ASSERT(vararg_count <= (int)sizeof(syscall_regs), "Expected at most 7 syscall arguments");
   for (int i = 0; i < vararg_count; i++) {
@@ -1304,6 +1323,7 @@ int main(int argc, char **argv) {
   add_builtin("$unreachable", handle_builtin_unreachable);
   add_builtin("$arg", handle_builtin_arg);
   add_builtin("$argc", handle_builtin_argc);
+  add_builtin("$fwargs", handle_builtin_fwargs);
   add_builtin("$addrof", handle_builtin_addrof);
   add_builtin("$call", handle_builtin_call);
   add_builtin("$entry", handle_builtin_entry);

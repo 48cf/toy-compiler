@@ -47,14 +47,22 @@ fn print_str(str) [len] void {
 
 fn print_int(value, base) [offset, ch] void {
   if == value 0 {
-    print_str "0"
-    ret
+    $write8 (+ int_buffer 0) '0'
+    = offset 1
+  } else {
+    = offset 0
+    while > value 0 {
+      $write8 (+ int_buffer offset) (lib.digit_char % value base)
+      = value (/ value base)
+      = offset (+ offset 1)
+    }
   }
-  = offset 0
-  while > value 0 {
-    $write8 (+ int_buffer offset) (lib.digit_char % value base)
-    = value (/ value base)
-    = offset (+ offset 1)
+  if == base 2 {
+    print_str "0b"
+  } else if == base 8 {
+    print_str "0o"
+  } else if == base 16 {
+    print_str "0x"
   }
   while > offset 0 {
     = offset (- offset 1)
@@ -97,6 +105,15 @@ fn print_fmt(fmt, ...) [arg, index, spec] void {
       print_char ($read8 fmt)
       = fmt (+ fmt 1)
     }
+  }
+  ret
+}
+
+fn assert(expr, fmt, ...) void {
+  if == expr 0 {
+    print_fmt fmt [$fwargs]
+    flush
+    $unreachable
   }
   ret
 }
