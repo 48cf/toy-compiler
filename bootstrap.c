@@ -19,6 +19,7 @@
 
 #define LOAD_ADDR 0x400000
 #define DATA_ADDR (LOAD_ADDR + 0x1000)
+#define TEXT_ADDR (LOAD_ADDR + 0x400000)
 
 enum {
   TOK_EOF,
@@ -644,19 +645,23 @@ static char *parse_ident_expr(char *data, struct scope *scope, struct identifier
       }
       *stack_values += 1;
       break;
-    case IDENT_GLOBAL:
-      // movabs rax, [imm64]
-      emit8(REX_W);
-      emit8(0xA1);
-      emit64(ident->global.offset);
+    case IDENT_GLOBAL: {
+      uint32_t push_addr = TEXT_ADDR + emitted_text_length;
+      // push [rip + disp32]
+      emit_text("\xFF\x35", 2);
+      emit32(ident->global.offset - (push_addr + 6));
+      *stack_values += 1;
+      break;
+    }
+    case IDENT_BUFFER: {
+      uint32_t lea_addr = TEXT_ADDR + emitted_text_length;
+      // lea rax, [rip + disp32]
+      emit_text("\x48\x8D\x05", 3);
+      emit32(ident->global.offset - (lea_addr + 7));
       push_reg(RAX);
       *stack_values += 1;
       break;
-    case IDENT_BUFFER:
-      movabs(RAX, ident->global.offset);
-      push_reg(RAX);
-      *stack_values += 1;
-      break;
+    }
     default:
       ASSERT(0, "ident->type == %d\n", ident->type);
   }
@@ -698,8 +703,11 @@ static char *parse_expression(char *data, struct scope *scope, int *stack_values
       }
       case TOK_STR: {
         union token str_tok = ADVANCE;
-        size_t str_addr = emit_data(str_tok.str_value, strlen(str_tok.str_value) + 1);
-        movabs(RAX, str_addr + DATA_ADDR);
+        uint64_t lea_addr = TEXT_ADDR + emitted_text_length;
+        uint64_t str_addr = emit_data(str_tok.str_value, strlen(str_tok.str_value) + 1);
+        // lea rax, [rip + disp32]
+        emit_text("\x48\x8D\x05", 3);
+        emit32((str_addr + DATA_ADDR) - (lea_addr + 7));
         push_reg(RAX);
         new_stack_values += 1;
         break;
@@ -721,13 +729,13 @@ static char *parse_expression(char *data, struct scope *scope, int *stack_values
               emit32(target.ident->stack_slot * 8);
             }
             break;
-          case IDENT_GLOBAL:
-            // movabs rax, imm64
-            movabs(RAX, target.ident->global.offset);
-            // pop [rax]
-            emit8(0x8F);
-            emit8(0x00);
+          case IDENT_GLOBAL: {
+            uint64_t pop_addr = TEXT_ADDR + emitted_text_length;
+            // pop [rip + disp32]
+            emit_text("\x8F\x05", 2);
+            emit32(target.ident->global.offset - (pop_addr + 6));
             break;
+          }
           default:
             ASSERT(0, "Expected a local or global variable, found %d\n", target.ident->type);
         }
@@ -1095,6 +1103,48 @@ static char *handle_builtin_argc(char *data, struct scope *scope, int *stack_val
   return data;
 }
 
+static char *handle_builtin_addrof(char *data, struct scope *scope, int *stack_values, int *does_return) {
+  *does_return = 1;
+  *stack_values += 1;
+  int token, length;
+  union token item = EXPECT(TOK_IDENT, "Expected identifier");
+  switch (item.ident->type) {
+    case IDENT_FUNC: {
+      ASSERT(item.ident->func.returns == 1, "Taking address of a function with multiple or no returns is invalid, found %d\n", item.ident->func.returns);
+      uint32_t lea_addr = emitted_text_length;
+      // lea rax, [rip + disp32]
+      emit_text("\x48\x8D\x05", 3);
+      emit32(item.ident->func.offset - (lea_addr + 7));
+      push_reg(RAX);
+      break;
+    }
+    default:
+      ASSERT(0, "Implement $addrof for ident->type == %d\n", item.ident->type);
+  }
+  return data;
+}
+
+static char *handle_builtin_call(char *data, struct scope *scope, int *stack_values, int *does_return) {
+  *does_return = 1;
+  *stack_values += 1;
+  int token, length, vararg_count, actual_vararg_count = 0, has_varargs = 0;
+  data = parse_expression(data, scope, stack_values, does_return, 1);
+  data = parse_varargs(data, scope, stack_values, does_return, &vararg_count, 0);
+  if (MATCHES(TOK_LSQUARE)) {
+    data = parse_varargs(data, scope, stack_values, does_return, &actual_vararg_count, 1);
+    has_varargs = 1;
+  }
+  // call [rsp + disp32]
+  emit_text("\xFF\x94\x24", 3);
+  emit32((vararg_count + actual_vararg_count) * 8);
+  if (has_varargs) {
+    emit_text("\x4A\x8D\x24\xE4", 4); // lea rsp, [rsp + r12 * 8]
+  }
+  add_reg_imm(RSP, vararg_count * 8);
+  push_reg(RAX);
+  return data;
+}
+
 static char *handle_builtin_entry(char *data, struct scope *scope, int *stack_values, int *does_return) {
   int token, length;
   union token entry = EXPECT(TOK_IDENT, "Expected entry function name");
@@ -1254,6 +1304,8 @@ int main(int argc, char **argv) {
   add_builtin("$unreachable", handle_builtin_unreachable);
   add_builtin("$arg", handle_builtin_arg);
   add_builtin("$argc", handle_builtin_argc);
+  add_builtin("$addrof", handle_builtin_addrof);
+  add_builtin("$call", handle_builtin_call);
   add_builtin("$entry", handle_builtin_entry);
   add_builtin("$syscall", handle_builtin_syscall);
   add_builtin("$sizeof", handle_builtin_sizeof);
@@ -1273,7 +1325,6 @@ int main(int argc, char **argv) {
   ASSERT(entry->type == IDENT_FUNC, "Entry point (_start) must be a function");
 
   uint64_t data_length_aligned = ALIGN_UP(emitted_data_length, 0x1000);
-  uint64_t text_addr = DATA_ADDR + data_length_aligned;
 
   struct elf_hdr elf;
 
@@ -1282,7 +1333,7 @@ int main(int argc, char **argv) {
   elf.header.e_type = ET_EXEC;
   elf.header.e_machine = EM_X86_64;
   elf.header.e_version = EV_CURRENT;
-  elf.header.e_entry = text_addr + entry->func.offset;
+  elf.header.e_entry = TEXT_ADDR + entry->func.offset;
   elf.header.e_phoff = offsetof(struct elf_hdr, phdr);
   elf.header.e_shoff = 0;
   elf.header.e_flags = 0;
@@ -1306,7 +1357,7 @@ int main(int argc, char **argv) {
   elf.phdr[1].p_type = PT_LOAD;
   elf.phdr[1].p_flags = PF_R | PF_W | PF_X;
   elf.phdr[1].p_offset = data_length_aligned + 0x1000;
-  elf.phdr[1].p_vaddr = text_addr;
+  elf.phdr[1].p_vaddr = TEXT_ADDR;
   elf.phdr[1].p_paddr = 0;
   elf.phdr[1].p_filesz = emitted_text_length;
   elf.phdr[1].p_memsz = emitted_text_length;
