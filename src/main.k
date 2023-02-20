@@ -1,6 +1,5 @@
 import "io.k" io
 import "sys.k" sys
-import "mem.k" mem
 
 var emit_text_buffer
 var emit_data_buffer
