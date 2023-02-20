@@ -17,7 +17,9 @@
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 
-#define LOAD_ADDR 0x400000
+// #define LOAD_ADDR 0x400000
+#define LOAD_ADDR 0xFFFFFFFF80000000
+
 #define DATA_ADDR (LOAD_ADDR + 0x1000)
 #define TEXT_ADDR (LOAD_ADDR + 0x400000)
 
@@ -592,6 +594,7 @@ static void patch_imm32(size_t from, size_t to, size_t length) {
 static uint8_t vararg_reg = 12;
 static uint8_t syscall_regs[] = {RAX, RDI, RSI, RDX, 10, 8, 9};
 static uint8_t return_regs[] = {RAX, RBX, RDX, RDI, RSI};
+static uint8_t param_regs[] = {RDI, RSI, RDX, RCX, 8, 9};
 
 static char *parse_expression(char *data, struct scope *scope, int *stack_values, int *does_return, int expected_values);
 static char *parse_block(char *data, struct scope *scope, int local_count, int *does_return);
@@ -846,27 +849,6 @@ static char *parse_expression(char *data, struct scope *scope, int *stack_values
         }
         new_stack_values -= 1;
         break;
-      case TOK_CARET:
-      case TOK_AMPERSAND:
-      case TOK_PIPE: {
-        ADVANCE;
-        data = parse_expression(data, scope, &new_stack_values, does_return, 2);
-        pop_reg(RAX);
-        switch (token) {
-          case TOK_CARET:
-            emit_text("\x48\x33\x04\x24", 4); // xor rax, [rsp]
-            break;
-          case TOK_AMPERSAND:
-            emit_text("\x48\x23\x04\x24", 4); // and rax, [rsp]
-            break;
-          case TOK_PIPE:
-            emit_text("\x48\x0B\x04\x24", 4); // or rax, [rsp]
-            break;
-        }
-        emit_text("\x48\x89\x04\x24", 4); // mov [rsp], rax
-        new_stack_values -= 1;
-        break;
-      }
       case TOK_LPAREN: {
         ADVANCE;
         int paren_stack_values = 0;
@@ -1041,7 +1023,16 @@ static struct scope *parse_file(char *path) {
           var_name.ident->global.size = byte_count.int_value;
           EXPECT(TOK_RSQUARE, "Expected a closing square bracket after buffer size");
         } else {
-          size_t ptr = emit_data_bytes(0, 8);
+          uint64_t value = 0;
+          if (MATCHES(TOK_INT)) {
+            union token init_value = ADVANCE;
+            value = init_value.int_value;
+          } else if (MATCHES(TOK_IDENT)) {
+            union token init_value = ADVANCE;
+            ASSERT(init_value.ident->type == IDENT_CONST, "Expected a constant value for variable initializer");
+            value = init_value.ident->value;
+          }
+          size_t ptr = emit_data(&value, sizeof(value));
           var_name.ident->type = IDENT_GLOBAL;
           var_name.ident->global.offset = ptr + DATA_ADDR;
           var_name.ident->global.size = 8;
@@ -1227,6 +1218,23 @@ static char *handle_builtin_call(char *data, struct scope *scope, int *stack_val
   return data;
 }
 
+static char *handle_builtin_ccall(char *data, struct scope *scope, int *stack_values, int *does_return) {
+  *does_return = 1;
+  *stack_values += 1;
+  int token, length, vararg_count, has_varargs = 0;
+  data = parse_expression(data, scope, stack_values, does_return, 1);
+  data = parse_varargs(data, scope, stack_values, does_return, &vararg_count);
+  ASSERT(!MATCHES(TOK_LSQUARE), "Can't pass varargs to C functions");
+  ASSERT(vararg_count <= (int)sizeof(param_regs), "Expected at most 6 function arguments");
+  for (int i = 0; i < vararg_count; i++) {
+    pop_reg(param_regs[vararg_count - i - 1]);
+  }
+  // call [rsp]
+  emit_text("\xFF\x14\x24", 3);
+  push_reg(RAX);
+  return data;
+}
+
 static char *handle_builtin_entry(char *data, struct scope *scope, int *stack_values, int *does_return) {
   int token, length;
   union token entry = EXPECT(TOK_IDENT, "Expected entry function name");
@@ -1359,6 +1367,89 @@ static char *handle_builtin_write64(char *data, struct scope *scope, int *stack_
   return data;
 }
 
+static char *handle_builtin_halt(char *data, struct scope *scope, int *stack_values, int *does_return) {
+  *does_return = 1;
+  emit_text("\xF4", 1); // hlt
+  return data;
+}
+
+static char *handle_builtin_pause(char *data, struct scope *scope, int *stack_values, int *does_return) {
+  *does_return = 1;
+  emit_text("\xF3\x90", 2); // pause
+  return data;
+}
+
+static char *handle_builtin_readcr(char *data, struct scope *scope, int *stack_values, int *does_return) {
+  *does_return = 1;
+  int token, length;
+  union token control_reg = EXPECT(TOK_INT, "Expected control register number");
+  ASSERT(control_reg.int_value <= 7, "Control register value must be between 0 and 7, got %lu", control_reg.int_value);
+  // mov rax, crN
+  emit_text("\x0F\x20", 2);
+  emit_modrm(0b11, control_reg.int_value, RAX);
+  push_reg(RAX);
+  *stack_values += 1;
+  return data;
+}
+
+static char *handle_builtin_writecr(char *data, struct scope *scope, int *stack_values, int *does_return) {
+  *does_return = 1;
+  int token, length;
+  union token control_reg = EXPECT(TOK_INT, "Expected control register number");
+  ASSERT(control_reg.int_value <= 7, "Control register value must be between 0 and 7, got %lu", control_reg.int_value);
+  data = parse_expression(data, scope, stack_values, does_return, 1);
+  pop_reg(RAX);
+  // mov crN, rax
+  emit_text("\x0F\x22", 2);
+  emit_modrm(0b11, control_reg.int_value, RAX);
+  *stack_values -= 1;
+  return data;
+}
+
+static char *handle_builtin_bitand(char *data, struct scope *scope, int *stack_values, int *does_return) {
+  *does_return = 1;
+  data = parse_expression(data, scope, stack_values, does_return, 2);
+  pop_reg(RAX);
+  emit_text("\x48\x23\x04\x24", 4); // and rax, [rsp]
+  emit_text("\x48\x89\x04\x24", 4); // mov [rsp], rax
+  *stack_values -= 1;
+  return data;
+}
+
+static char *handle_builtin_bitor(char *data, struct scope *scope, int *stack_values, int *does_return) {
+  *does_return = 1;
+  data = parse_expression(data, scope, stack_values, does_return, 2);
+  pop_reg(RAX);
+  emit_text("\x48\x0B\x04\x24", 4); // or rax, [rsp]
+  emit_text("\x48\x89\x04\x24", 4); // mov [rsp], rax
+  *stack_values -= 1;
+  return data;
+}
+
+static char *handle_builtin_bitxor(char *data, struct scope *scope, int *stack_values, int *does_return) {
+  *does_return = 1;
+  data = parse_expression(data, scope, stack_values, does_return, 2);
+  pop_reg(RAX);
+  emit_text("\x48\x33\x04\x24", 4); // xor rax, [rsp]
+  emit_text("\x48\x89\x04\x24", 4); // mov [rsp], rax
+  *stack_values -= 1;
+  return data;
+}
+
+static char *handle_builtin_bitnot(char *data, struct scope *scope, int *stack_values, int *does_return) {
+  *does_return = 1;
+  data = parse_expression(data, scope, stack_values, does_return, 1);
+  emit_text("\x48\xF7\x14\x24", 4); // not [rsp]
+  return data;
+}
+
+static char *handle_builtin_neg(char *data, struct scope *scope, int *stack_values, int *does_return) {
+  *does_return = 1;
+  data = parse_expression(data, scope, stack_values, does_return, 1);
+  emit_text("\x48\xF7\x1C\x24", 4); // neg [rsp]
+  return data;
+}
+
 static void add_builtin(char *name, builtin_handler_t handler) {
   struct identifier *ident = lookup_ident(&builtin_scope, name, strlen(name), 1);
   ASSERT(ident->type == IDENT_NONE, "Tried to override existing identifier with builtin '%s'\n", name);
@@ -1389,6 +1480,7 @@ int main(int argc, char **argv) {
   add_builtin("$fwargs", handle_builtin_fwargs);
   add_builtin("$addrof", handle_builtin_addrof);
   add_builtin("$call", handle_builtin_call);
+  add_builtin("$ccall", handle_builtin_ccall);
   add_builtin("$entry", handle_builtin_entry);
   add_builtin("$syscall", handle_builtin_syscall);
   add_builtin("$sizeof", handle_builtin_sizeof);
@@ -1400,6 +1492,15 @@ int main(int argc, char **argv) {
   add_builtin("$write16", handle_builtin_write16);
   add_builtin("$write32", handle_builtin_write32);
   add_builtin("$write64", handle_builtin_write64);
+  add_builtin("$halt", handle_builtin_halt);
+  add_builtin("$pause", handle_builtin_pause);
+  add_builtin("$readcr", handle_builtin_readcr);
+  add_builtin("$writecr", handle_builtin_writecr);
+  add_builtin("$bitand", handle_builtin_bitand);
+  add_builtin("$bitor", handle_builtin_bitor);
+  add_builtin("$bitxor", handle_builtin_bitxor);
+  add_builtin("$bitnot", handle_builtin_bitnot);
+  add_builtin("$neg", handle_builtin_neg);
 
   struct scope *root_scope = parse_file(realpath(argv[1], NULL));
   struct identifier *entry = lookup_ident(root_scope, "_start", 6, 0);
