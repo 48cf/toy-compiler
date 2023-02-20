@@ -52,8 +52,13 @@ enum {
   TOK_NEQ,
   TOK_BANG,
   TOK_AMPERSAND,
+  TOK_CARET,
+  TOK_PIPE,
+  TOK_TILDE,
 
+  TOK_KW_CONST,
   TOK_KW_ELSE,
+  TOK_KW_ENUM,
   TOK_KW_FN,
   TOK_KW_IF,
   TOK_KW_IMPORT,
@@ -71,6 +76,7 @@ enum {
   IDENT_VAR,
   IDENT_GLOBAL,
   IDENT_BUFFER,
+  IDENT_CONST,
 
   IDENT_MODULE,
   IDENT_PARSING,
@@ -87,7 +93,7 @@ struct identifier {
   int type;
   char *ident;
   union {
-    void *value;
+    uint64_t value;
     struct {
       uint32_t offset;
       uint16_t flags;
@@ -255,22 +261,31 @@ static int get_escaped_char(char **data_ptr) {
   ASSERT(0, "Found an invalid escape '\\%c'\n", *data);
 }
 
-static int get_token(char **data_ptr, int *length, struct scope *scope) {
 #define IS_KW(x, y) do { if (!strncmp(start, x, sizeof(x) - 1) && !is_ident_char(start[sizeof(x) - 1])) return y; } while (0)
 #define CHAR_TOKEN(x) do { *length = 1; return x; } while (0)
 #define STR_TOKEN(x, y) do { if (!strncmp(data, x, sizeof(x) - 1)) { *length = sizeof(x) - 1; return y; } } while (0)
 
+static int get_token(char **data_ptr, int *length, struct scope *scope) {
 start:;
   *length = 0;
   skip_whitespace(data_ptr);
   char *data = *data_ptr;
   int base = 10;
+  int negate = 0;
 
   switch (*data) {
     case '\0':
       return TOK_EOF;
     case '+': CHAR_TOKEN(TOK_PLUS);
-    case '-': CHAR_TOKEN(TOK_MINUS);
+    case '-':
+      switch (*(data + 1)) {
+        case '0' ... '9':
+          data++;
+          *length += 1;
+          negate = 1;
+          goto parse_int;
+      }
+      CHAR_TOKEN(TOK_MINUS);
     case '*': CHAR_TOKEN(TOK_STAR);
     case '/':
       if (*(data + 1) == '/') {
@@ -292,7 +307,10 @@ start:;
     case '.':
       STR_TOKEN("...", TOK_3DOTS);
       CHAR_TOKEN(TOK_DOT);
+    case '^': CHAR_TOKEN(TOK_CARET);
     case '&': CHAR_TOKEN(TOK_AMPERSAND);
+    case '|': CHAR_TOKEN(TOK_PIPE);
+    case '~': CHAR_TOKEN(TOK_TILDE);
     case '<':
       STR_TOKEN("<=", TOK_LTE);
       STR_TOKEN("<<", TOK_LSHIFT);
@@ -319,7 +337,9 @@ start:;
       int ident_length = data - start;
       *length = ident_length;
 
+      IS_KW("const", TOK_KW_CONST);
       IS_KW("else", TOK_KW_ELSE);
+      IS_KW("enum", TOK_KW_ENUM);
       IS_KW("fn", TOK_KW_FN);
       IS_KW("if", TOK_KW_IF);
       IS_KW("import", TOK_KW_IMPORT);
@@ -332,6 +352,7 @@ start:;
       token_value.ident = ident;
       return TOK_IDENT;
     }
+parse_int:
     case '0':
       switch (data[1]) {
         case 'b': base = 2; data += 2; *length = 2; break;
@@ -347,6 +368,10 @@ start:;
         data++;
         token_value.int_value *= base;
         token_value.int_value += digit;
+      }
+      if (negate) {
+        token_value.int_value -= 1;
+        token_value.int_value = ~token_value.int_value;
       }
       *length += data - start;
       return TOK_INT;
@@ -445,9 +470,14 @@ static const char *token_name(int token) {
     case TOK_ASSIGN: return "TOK_ASSIGN";
     case TOK_NEQ: return "TOK_NEQ";
     case TOK_BANG: return "TOK_BANG";
+    case TOK_CARET: return "TOK_CARET";
     case TOK_AMPERSAND: return "TOK_AMPERSAND";
+    case TOK_PIPE: return "TOK_PIPE";
+    case TOK_TILDE: return "TOK_TILDE";
 
+    case TOK_KW_CONST: return "TOK_KW_CONST";
     case TOK_KW_ELSE: return "TOK_KW_ELSE";
+    case TOK_KW_ENUM: return "TOK_KW_ENUM";
     case TOK_KW_FN: return "TOK_KW_FN";
     case TOK_KW_IF: return "TOK_KW_IF";
     case TOK_KW_IMPORT: return "TOK_KW_IMPORT";
@@ -567,11 +597,9 @@ static char *parse_expression(char *data, struct scope *scope, int *stack_values
 static char *parse_block(char *data, struct scope *scope, int local_count, int *does_return);
 
 static void setup_r12(int value) {
-  if (value > 0) {
-    // push imm8
-    emit8(0x6A);
-    emit8(value);
-  }
+  // push imm8
+  emit8(0x6A);
+  emit8(value);
   pop_reg(12);
 }
 
@@ -661,6 +689,12 @@ static char *parse_ident_expr(char *data, struct scope *scope, struct identifier
       // lea rax, [rip + disp32]
       emit_text("\x48\x8D\x05", 3);
       emit32(ident->global.offset - (lea_addr + 7));
+      push_reg(RAX);
+      *stack_values += 1;
+      break;
+    }
+    case IDENT_CONST: {
+      movabs(RAX, ident->value);
       push_reg(RAX);
       *stack_values += 1;
       break;
@@ -812,6 +846,27 @@ static char *parse_expression(char *data, struct scope *scope, int *stack_values
         }
         new_stack_values -= 1;
         break;
+      case TOK_CARET:
+      case TOK_AMPERSAND:
+      case TOK_PIPE: {
+        ADVANCE;
+        data = parse_expression(data, scope, &new_stack_values, does_return, 2);
+        pop_reg(RAX);
+        switch (token) {
+          case TOK_CARET:
+            emit_text("\x48\x33\x04\x24", 4); // xor rax, [rsp]
+            break;
+          case TOK_AMPERSAND:
+            emit_text("\x48\x23\x04\x24", 4); // and rax, [rsp]
+            break;
+          case TOK_PIPE:
+            emit_text("\x48\x0B\x04\x24", 4); // or rax, [rsp]
+            break;
+        }
+        emit_text("\x48\x89\x04\x24", 4); // mov [rsp], rax
+        new_stack_values -= 1;
+        break;
+      }
       case TOK_LPAREN: {
         ADVANCE;
         int paren_stack_values = 0;
@@ -993,6 +1048,14 @@ static struct scope *parse_file(char *path) {
         }
         break;
       }
+      case TOK_KW_CONST: {
+        union token const_name = EXPECT(TOK_IDENT, "Expected an identifier");
+        ASSERT(const_name.ident->type == IDENT_NONE, "Constant '%s' was already defined before\n", const_name.ident->ident);
+        union token const_value = EXPECT(TOK_INT, "Expected a value");
+        const_name.ident->type = IDENT_CONST;
+        const_name.ident->value = const_value.int_value;
+        break;
+      }
       case TOK_KW_FN: {
         union token fn_name = EXPECT(TOK_IDENT, "Expected an identifier after keyword 'fn'");
         ASSERT(fn_name.ident->type == IDENT_NONE, "Function '%s' was already defined before\n", fn_name.ident->ident);
@@ -1066,7 +1129,7 @@ static struct scope *parse_file(char *path) {
         break;
       }
       default:
-        ASSERT(0, "Expected an 'fn' keyword, got %s\n", token_name(token));
+        ASSERT(0, "Expected an import, function, global or constant, got %s\n", token_name(token));
     }
   }
 }
@@ -1300,7 +1363,7 @@ static void add_builtin(char *name, builtin_handler_t handler) {
   struct identifier *ident = lookup_ident(&builtin_scope, name, strlen(name), 1);
   ASSERT(ident->type == IDENT_NONE, "Tried to override existing identifier with builtin '%s'\n", name);
   ident->type = IDENT_BUILTIN;
-  ident->value = handler;
+  ident->value = (uint64_t)handler;
 }
 
 struct elf_hdr {
