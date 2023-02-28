@@ -7,10 +7,8 @@
 #include <fcntl.h>
 #include <libgen.h>
 #include <limits.h>
-#include <linux/limits.h>
 #include <unistd.h>
 #include <sys/mman.h>
-#include <elf.h>
 
 #define ASSERT(x, ...) do { if (!(x)) { fprintf(stderr, __VA_ARGS__); exit(1); } } while (0)
 #define ALIGN_UP(x, y) (((x) + ((y) - 1)) & ~((y) - 1))
@@ -400,11 +398,11 @@ parse_int:
     case '"': {
       int escaped = 0, str_length = 0, capacity = 32;
       char *start = data++;
-      char *result = calloc(capacity, 1);
+      char *result = malloc(capacity);
       for (; *data != '"' || escaped; data++) {
         if (str_length == capacity - 1) {
           capacity *= 2;
-          result = reallocarray(result, capacity, 1);
+          result = realloc(result, capacity);
         }
 
         if (!escaped) {
@@ -606,7 +604,7 @@ static void setup_r12(int value) {
   pop_reg(12);
 }
 
-static char *parse_varargs(char *data, struct scope *scope, int *stack_values, int *does_return, int *vararg_count) {
+static char *parse_varargs(char *data, struct scope *scope, int *does_return, int *vararg_count) {
   int token, length, vararg_stack_values = 0;
   EXPECT(TOK_LSQUARE, "Expected opening square bracket before varargs");
   while (!MATCHES(TOK_RSQUARE)) {
@@ -630,7 +628,7 @@ static char *parse_ident_expr(char *data, struct scope *scope, struct identifier
       data = parse_expression(data, scope, stack_values, does_return, ident->func.arity);
       if (ident->func.flags & FUNC_VARARG) {
         int vararg_count;
-        data = parse_varargs(data, scope, stack_values, does_return, &vararg_count);
+        data = parse_varargs(data, scope, does_return, &vararg_count);
         setup_r12(vararg_count);
       }
       size_t call_addr = emitted_text_length;
@@ -1126,6 +1124,8 @@ static struct scope *parse_file(char *path) {
 }
 
 static char *handle_builtin_unreachable(char *data, struct scope *scope, int *stack_values, int *does_return) {
+  (void)scope;
+  (void)stack_values;
   *does_return = 0;
   emit_text("\x0F\x0B", 2); // ud2
   return data;
@@ -1151,6 +1151,7 @@ static char *handle_builtin_arg(char *data, struct scope *scope, int *stack_valu
 }
 
 static char *handle_builtin_argc(char *data, struct scope *scope, int *stack_values, int *does_return) {
+  (void)scope;
   *does_return = 1;
   *stack_values += 1;
   push_reg(12);
@@ -1158,6 +1159,8 @@ static char *handle_builtin_argc(char *data, struct scope *scope, int *stack_val
 }
 
 static char *handle_builtin_fwargs(char *data, struct scope *scope, int *stack_values, int *does_return) {
+  (void)scope;
+  (void)stack_values;
   *does_return = 1;
   emit_text("\x6A\x00", 2); // push 0
   pop_reg(RAX);
@@ -1201,9 +1204,9 @@ static char *handle_builtin_call(char *data, struct scope *scope, int *stack_val
   *stack_values += 1;
   int token, length, vararg_count, actual_vararg_count = 0, has_varargs = 0;
   data = parse_expression(data, scope, stack_values, does_return, 1);
-  data = parse_varargs(data, scope, stack_values, does_return, &vararg_count);
+  data = parse_varargs(data, scope, does_return, &vararg_count);
   if (MATCHES(TOK_LSQUARE)) {
-    data = parse_varargs(data, scope, stack_values, does_return, &actual_vararg_count);
+    data = parse_varargs(data, scope, does_return, &actual_vararg_count);
     setup_r12(actual_vararg_count);
     has_varargs = 1;
   }
@@ -1223,7 +1226,7 @@ static char *handle_builtin_ccall(char *data, struct scope *scope, int *stack_va
   *stack_values += 1;
   int token, length, vararg_count, has_varargs = 0;
   data = parse_expression(data, scope, stack_values, does_return, 1);
-  data = parse_varargs(data, scope, stack_values, does_return, &vararg_count);
+  data = parse_varargs(data, scope, does_return, &vararg_count);
   ASSERT(!MATCHES(TOK_LSQUARE), "Can't pass varargs to C functions");
   ASSERT(vararg_count <= (int)sizeof(param_regs), "Expected at most 6 function arguments");
   for (int i = 0; i < vararg_count; i++) {
@@ -1251,13 +1254,14 @@ static char *handle_builtin_entry(char *data, struct scope *scope, int *stack_va
   emit32(entry.ident->func.offset - (call_addr + 5));
   add_reg_imm(RSP, 24);
   push_reg(RAX);
+  *does_return = 1;
   *stack_values += 1;
   return data;
 }
 
 static char *handle_builtin_syscall(char *data, struct scope *scope, int *stack_values, int *does_return) {
   int token, lengthm, vararg_count;
-  data = parse_varargs(data, scope, stack_values, does_return, &vararg_count);
+  data = parse_varargs(data, scope, does_return, &vararg_count);
   ASSERT(vararg_count > 0, "Expected at least one syscall argument");
   ASSERT(vararg_count <= (int)sizeof(syscall_regs), "Expected at most 7 syscall arguments");
   for (int i = 0; i < vararg_count; i++) {
@@ -1287,6 +1291,7 @@ static char *handle_builtin_sizeof(char *data, struct scope *scope, int *stack_v
   // push imm32
   emit8(0x68);
   emit32(size);
+  *does_return = 1;
   *stack_values += 1;
   return data;
 }
@@ -1368,12 +1373,16 @@ static char *handle_builtin_write64(char *data, struct scope *scope, int *stack_
 }
 
 static char *handle_builtin_halt(char *data, struct scope *scope, int *stack_values, int *does_return) {
+  (void)scope;
+  (void)stack_values;
   *does_return = 1;
   emit_text("\xF4", 1); // hlt
   return data;
 }
 
 static char *handle_builtin_pause(char *data, struct scope *scope, int *stack_values, int *does_return) {
+  (void)scope;
+  (void)stack_values;
   *does_return = 1;
   emit_text("\xF3\x90", 2); // pause
   return data;
@@ -1383,7 +1392,7 @@ static char *handle_builtin_readcr(char *data, struct scope *scope, int *stack_v
   *does_return = 1;
   int token, length;
   union token control_reg = EXPECT(TOK_INT, "Expected control register number");
-  ASSERT(control_reg.int_value <= 7, "Control register value must be between 0 and 7, got %lu", control_reg.int_value);
+  ASSERT(control_reg.int_value <= 7, "Control register value must be between 0 and 7, got %llu", control_reg.int_value);
   // mov rax, crN
   emit_text("\x0F\x20", 2);
   emit_modrm(0b11, control_reg.int_value, RAX);
@@ -1396,7 +1405,7 @@ static char *handle_builtin_writecr(char *data, struct scope *scope, int *stack_
   *does_return = 1;
   int token, length;
   union token control_reg = EXPECT(TOK_INT, "Expected control register number");
-  ASSERT(control_reg.int_value <= 7, "Control register value must be between 0 and 7, got %lu", control_reg.int_value);
+  ASSERT(control_reg.int_value <= 7, "Control register value must be between 0 and 7, got %llu", control_reg.int_value);
   data = parse_expression(data, scope, stack_values, does_return, 1);
   pop_reg(RAX);
   // mov crN, rax
@@ -1457,13 +1466,71 @@ static void add_builtin(char *name, builtin_handler_t handler) {
   ident->value = (uint64_t)handler;
 }
 
+typedef uint64_t Elf64_Addr;
+typedef uint64_t Elf64_Off;
+typedef uint16_t Elf64_Half;
+typedef uint32_t  Elf64_Word;
+typedef int32_t Elf64_Sword;
+typedef uint64_t Elf64_Xword;
+typedef int64_t Elf64_Sxword;
+
+#define ET_EXEC 2
+#define EM_X86_64 62
+#define EV_CURRENT 1
+#define PT_LOAD 1
+#define PF_X 1
+#define PF_W 2
+#define PF_R 4
+
+struct Elf64_Ehdr {
+  unsigned char e_ident[16];
+
+  Elf64_Half e_type;
+  Elf64_Half e_machine;
+  Elf64_Word e_version;
+  Elf64_Addr e_entry;
+  Elf64_Off e_phoff;
+  Elf64_Off e_shoff;
+  Elf64_Word e_flags;
+  Elf64_Half e_ehsize;
+  Elf64_Half e_phentsize;
+  Elf64_Half e_phnum;
+  Elf64_Half e_shentsize;
+  Elf64_Half e_shnum;
+  Elf64_Half e_shstrndx;
+};
+
+struct Elf64_Phdr {
+  Elf64_Word p_type;
+  Elf64_Word p_flags;
+  Elf64_Off p_offset;
+  Elf64_Addr p_vaddr;
+  Elf64_Addr p_paddr;
+  Elf64_Xword p_filesz;
+  Elf64_Xword p_memsz;
+  Elf64_Xword p_align;
+};
+
+struct Elf64_Shdr {
+  Elf64_Word sh_name;
+  Elf64_Word sh_type;
+  Elf64_Xword sh_flags;
+  Elf64_Addr sh_addr;
+  Elf64_Off sh_offset;
+  Elf64_Xword sh_size;
+  Elf64_Word sh_link;
+  Elf64_Word sh_info;
+  Elf64_Xword sh_addralign;
+  Elf64_Xword sh_entsize;
+};
+
 struct elf_hdr {
-  Elf64_Ehdr header;
-  Elf64_Phdr phdr[2];
+  struct Elf64_Ehdr header;
+  struct Elf64_Phdr phdr[2];
 };
 
 int main(int argc, char **argv) {
-  ASSERT(argc >= 0, "Usage: %s <input> <output>\n", argv[0]);
+  ASSERT(argc >= 3, "Usage: %s <input> <output>\n", argv[0]);
 
   output_file = openat(AT_FDCWD, argv[2], O_RDWR | O_CREAT | O_TRUNC);
   ASSERT(output_file > 0, "Failed to open output file %s: %s\n", argv[2], strerror(errno));
@@ -1523,9 +1590,9 @@ int main(int argc, char **argv) {
   elf.header.e_flags = 0;
 
   elf.header.e_ehsize = 0;
-  elf.header.e_phentsize = sizeof(Elf64_Phdr);
-  elf.header.e_phnum = sizeof(elf.phdr) / sizeof(Elf64_Phdr);
-  elf.header.e_shentsize = sizeof(Elf64_Shdr);
+  elf.header.e_phentsize = sizeof(struct Elf64_Phdr);
+  elf.header.e_phnum = sizeof(elf.phdr) / sizeof(struct Elf64_Phdr);
+  elf.header.e_shentsize = sizeof(struct Elf64_Shdr);
   elf.header.e_shnum = 0;
   elf.header.e_shstrndx = 0;
 

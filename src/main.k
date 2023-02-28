@@ -12,16 +12,16 @@ fn main(argc, argv, envp) {
 
   = emit_text_buffer (
     sys.mmap 0 0x80000
-    | sys.PROT_READ sys.PROT_WRITE
-    | sys.MAP_ANONYMOUS sys.MAP_PRIVATE
+    $bitor sys.PROT_READ sys.PROT_WRITE
+    $bitor sys.MAP_ANONYMOUS sys.MAP_PRIVATE
     -1 0
   )
   io.assert > emit_text_buffer 0 "Failed to map code buffer\n" []
 
   = emit_data_buffer (
-    sys.mmap 1231231983 0x800001231231
-    | sys.PROT_READ sys.PROT_WRITE
-    | sys.MAP_ANONYMOUS sys.MAP_PRIVATE
+    sys.mmap 0 0x80000
+    $bitor sys.PROT_READ sys.PROT_WRITE
+    $bitor sys.MAP_ANONYMOUS sys.MAP_PRIVATE
     -1 0
   )
   io.assert > emit_data_buffer 0 "Failed to map data buffer\n" []
