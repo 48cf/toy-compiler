@@ -9,6 +9,9 @@ clean:
 	rm -rf out
 
 run: out/test.iso
+	qemu-system-x86_64 -M q35 -m 1G -cdrom $< -boot d
+
+run-kvm: out/test.iso
 	qemu-system-x86_64 -M q35 -m 1G -cdrom $< -boot d -enable-kvm
 
 limine:
