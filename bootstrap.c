@@ -15,11 +15,9 @@
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 
-// #define LOAD_ADDR 0x400000
-#define LOAD_ADDR 0xFFFFFFFF80000000
-
-#define DATA_ADDR (LOAD_ADDR + 0x1000)
-#define TEXT_ADDR (LOAD_ADDR + 0x400000)
+static uint64_t load_base;
+static uint64_t data_base;
+static uint64_t text_base;
 
 enum {
   TOK_EOF,
@@ -122,7 +120,6 @@ union token {
 
 typedef char *(*builtin_handler_t)(char *, struct scope *, int *, int *);
 
-static int output_file = -1;
 static union token token_value;
 static struct scope builtin_scope;
 static struct scope modules_scope;
@@ -678,7 +675,7 @@ static char *parse_ident_expr(char *data, struct scope *scope, struct identifier
       *stack_values += 1;
       break;
     case IDENT_GLOBAL: {
-      uint32_t push_addr = TEXT_ADDR + emitted_text_length;
+      uint32_t push_addr = text_base + emitted_text_length;
       // push [rip + disp32]
       emit_text("\xFF\x35", 2);
       emit32(ident->global.offset - (push_addr + 6));
@@ -686,7 +683,7 @@ static char *parse_ident_expr(char *data, struct scope *scope, struct identifier
       break;
     }
     case IDENT_BUFFER: {
-      uint32_t lea_addr = TEXT_ADDR + emitted_text_length;
+      uint32_t lea_addr = text_base + emitted_text_length;
       // lea rax, [rip + disp32]
       emit_text("\x48\x8D\x05", 3);
       emit32(ident->global.offset - (lea_addr + 7));
@@ -741,11 +738,11 @@ static char *parse_expression(char *data, struct scope *scope, int *stack_values
       }
       case TOK_STR: {
         union token str_tok = ADVANCE;
-        uint64_t lea_addr = TEXT_ADDR + emitted_text_length;
+        uint64_t lea_addr = text_base + emitted_text_length;
         uint64_t str_addr = emit_data(str_tok.str_value, strlen(str_tok.str_value) + 1);
         // lea rax, [rip + disp32]
         emit_text("\x48\x8D\x05", 3);
-        emit32((str_addr + DATA_ADDR) - (lea_addr + 7));
+        emit32((str_addr + data_base) - (lea_addr + 7));
         push_reg(RAX);
         new_stack_values += 1;
         break;
@@ -768,7 +765,7 @@ static char *parse_expression(char *data, struct scope *scope, int *stack_values
             }
             break;
           case IDENT_GLOBAL: {
-            uint64_t pop_addr = TEXT_ADDR + emitted_text_length;
+            uint64_t pop_addr = text_base + emitted_text_length;
             // pop [rip + disp32]
             emit_text("\x8F\x05", 2);
             emit32(target.ident->global.offset - (pop_addr + 6));
@@ -1017,7 +1014,7 @@ static struct scope *parse_file(char *path) {
           union token byte_count = EXPECT(TOK_INT, "Expected the buffer size");
           size_t ptr = emit_data_bytes(0, byte_count.int_value);
           var_name.ident->type = IDENT_BUFFER;
-          var_name.ident->global.offset = ptr + DATA_ADDR;
+          var_name.ident->global.offset = ptr + data_base;
           var_name.ident->global.size = byte_count.int_value;
           EXPECT(TOK_RSQUARE, "Expected a closing square bracket after buffer size");
         } else {
@@ -1032,7 +1029,7 @@ static struct scope *parse_file(char *path) {
           }
           size_t ptr = emit_data(&value, sizeof(value));
           var_name.ident->type = IDENT_GLOBAL;
-          var_name.ident->global.offset = ptr + DATA_ADDR;
+          var_name.ident->global.offset = ptr + data_base;
           var_name.ident->global.size = 8;
         }
         break;
@@ -1530,10 +1527,43 @@ struct elf_hdr {
 };
 
 int main(int argc, char **argv) {
-  ASSERT(argc >= 3, "Usage: %s <input> <output>\n", argv[0]);
+  char *input_file = NULL, *output_file = NULL;
 
-  output_file = openat(AT_FDCWD, argv[2], O_RDWR | O_CREAT | O_TRUNC);
-  ASSERT(output_file > 0, "Failed to open output file %s: %s\n", argv[2], strerror(errno));
+  for (int i = 1; i < argc; ) {
+    if (!strncmp(argv[i], "-o", 3)) {
+      ASSERT(output_file == NULL, "Output file was specified before: '%s'\n", output_file);
+      output_file = argv[i + 1];
+      i += 2;
+    } else if (!strncmp(argv[i], "-b", 3)) {
+      ASSERT(load_base == 0, "Load base was specified before: 0x%llx\n", load_base);
+      if (!strncmp(argv[i + 1], "0x", 2)) {
+        load_base = strtoull(argv[i + 1] + 2, NULL, 16);
+      } else {
+        load_base = strtoull(argv[i + 1], NULL, 10);
+      }
+      ASSERT(load_base != 0 && load_base != ULLONG_MAX, "Invalid base address: %s\n", argv[i + 1]);
+      i += 2;
+    } else if (argv[i][0] == '-') {
+      ASSERT(0, "Unrecognized option '%s'\n", argv[i]);
+    } else {
+      ASSERT(input_file == NULL, "Input file was specified before: '%s'\n", input_file);
+      input_file = argv[i];
+      i++;
+    }
+  }
+
+  if (load_base == 0) {
+    load_base = 0x400000;
+  }
+
+  data_base = load_base + 0x1000;
+  text_base = load_base + 0x400000;
+
+  ASSERT(input_file != NULL, "No input file specified\n");
+  ASSERT(output_file != NULL, "No output file specified\n");
+
+  int output_fd = openat(AT_FDCWD, output_file, O_RDWR | O_CREAT | O_TRUNC);
+  ASSERT(output_fd > 0, "Failed to open output file %s: %s\n", output_file, strerror(errno));
 
   emit_text_buffer = mmap(NULL, 0x80000, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
   ASSERT(emit_text_buffer != MAP_FAILED, "Failed to map code buffer: %s\n", strerror(errno));
@@ -1569,7 +1599,7 @@ int main(int argc, char **argv) {
   add_builtin("$bitnot", handle_builtin_bitnot);
   add_builtin("$neg", handle_builtin_neg);
 
-  struct scope *root_scope = parse_file(realpath(argv[1], NULL));
+  struct scope *root_scope = parse_file(realpath(input_file, NULL));
   struct identifier *entry = lookup_ident(root_scope, "_start", 6, 0);
 
   ASSERT(entry != NULL, "No entry point (_start) was declared");
@@ -1584,7 +1614,7 @@ int main(int argc, char **argv) {
   elf.header.e_type = ET_EXEC;
   elf.header.e_machine = EM_X86_64;
   elf.header.e_version = EV_CURRENT;
-  elf.header.e_entry = TEXT_ADDR + entry->func.offset;
+  elf.header.e_entry = text_base + entry->func.offset;
   elf.header.e_phoff = offsetof(struct elf_hdr, phdr);
   elf.header.e_shoff = 0;
   elf.header.e_flags = 0;
@@ -1599,7 +1629,7 @@ int main(int argc, char **argv) {
   elf.phdr[0].p_type = PT_LOAD;
   elf.phdr[0].p_flags = PF_R | PF_W;
   elf.phdr[0].p_offset = 0x1000;
-  elf.phdr[0].p_vaddr = DATA_ADDR;
+  elf.phdr[0].p_vaddr = data_base;
   elf.phdr[0].p_paddr = 0;
   elf.phdr[0].p_filesz = emitted_data_length;
   elf.phdr[0].p_memsz = emitted_data_length;
@@ -1608,14 +1638,14 @@ int main(int argc, char **argv) {
   elf.phdr[1].p_type = PT_LOAD;
   elf.phdr[1].p_flags = PF_R | PF_W | PF_X;
   elf.phdr[1].p_offset = data_length_aligned + 0x1000;
-  elf.phdr[1].p_vaddr = TEXT_ADDR;
+  elf.phdr[1].p_vaddr = text_base;
   elf.phdr[1].p_paddr = 0;
   elf.phdr[1].p_filesz = emitted_text_length;
   elf.phdr[1].p_memsz = emitted_text_length;
   elf.phdr[1].p_align = 0x1000;
 
-  ftruncate(output_file, data_length_aligned + emitted_text_length + 0x1000);
-  pwrite(output_file, &elf, sizeof(elf), 0);
-  pwrite(output_file, emit_data_buffer, emitted_data_length, 0x1000);
-  pwrite(output_file, emit_text_buffer, emitted_text_length, data_length_aligned + 0x1000);
+  ftruncate(output_fd, data_length_aligned + emitted_text_length + 0x1000);
+  pwrite(output_fd, &elf, sizeof(elf), 0);
+  pwrite(output_fd, emit_data_buffer, emitted_data_length, 0x1000);
+  pwrite(output_fd, emit_text_buffer, emitted_text_length, data_length_aligned + 0x1000);
 }

@@ -24,7 +24,7 @@ out/bootstrap: bootstrap.c
 
 out/selfhost1: out/bootstrap $(SELFHOST_FILES)
 	@mkdir -p $(@D)
-	$< src/main.k $@
+	$< -o $@ src/main.k
 
 # out/selfhost2: out/selfhost1 $(SELFHOST_FILES)
 # 	@mkdir -p $(@D)
@@ -32,7 +32,7 @@ out/selfhost1: out/bootstrap $(SELFHOST_FILES)
 
 out/kernel: out/bootstrap $(KERNEL_FILES)
 	@mkdir -p $(@D)
-	$< kernel/main.k $@
+	$< -o $@ -b 0xffffffff80000000 kernel/main.k
 
 out/test.iso: limine out/kernel limine.cfg
 	rm -rf out/iso_root
